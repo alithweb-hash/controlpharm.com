@@ -1,11 +1,33 @@
 import { useState, useEffect, type FormEvent } from 'react'
-import { Lock, Unlock, AlertCircle, Laptop, CheckCircle, XCircle, Trash2, ShieldCheck, RefreshCw, Database, Store, ShieldAlert, LogOut, KeyRound } from 'lucide-react'
+import {
+  Lock,
+  Unlock,
+  AlertCircle,
+  Laptop,
+  CheckCircle,
+  XCircle,
+  Trash2,
+  ShieldCheck,
+  RefreshCw,
+  Database,
+  Store,
+  ShieldAlert,
+  LogOut,
+  KeyRound,
+  PlusCircle,
+  Calendar,
+  Infinity as InfinityIcon,
+  Download,
+  Clock,
+} from 'lucide-react'
 
 interface Device {
   id: string
   hostname?: string
   osInfo?: string
   isApproved?: boolean
+  licenseType?: 'lifetime' | 'timed'
+  expiresAt?: string | null
   lastSeen?: string
   updatedAt?: string
   customerId?: string
@@ -20,6 +42,31 @@ interface CustomerInfo {
   hostname?: string
 }
 
+type PlanPreset = 'lifetime' | '30' | '90' | '180' | '365' | 'custom'
+
+function getExpiryInfo(device: Device) {
+  if (device.licenseType !== 'timed') {
+    return { isTimed: false, isExpired: false, daysLeft: null as number | null, label: 'دائم (مدى الحياة)' }
+  }
+  if (!device.expiresAt) {
+    return { isTimed: true, isExpired: true, daysLeft: 0, label: 'منتهي الصلاحية' }
+  }
+  const ms = Date.parse(device.expiresAt)
+  if (Number.isNaN(ms)) {
+    return { isTimed: true, isExpired: true, daysLeft: 0, label: 'منتهي الصلاحية' }
+  }
+  const diff = ms - Date.now()
+  const isExpired = diff <= 0
+  const daysLeft = isExpired ? 0 : Math.ceil(diff / (1000 * 60 * 60 * 24))
+  const dateStr = new Date(ms).toLocaleDateString('ar-IQ')
+  return {
+    isTimed: true,
+    isExpired,
+    daysLeft,
+    label: isExpired ? `منتهي منذ ${dateStr}` : `ينتهي ${dateStr} (متبقي ${daysLeft} يوم)`,
+  }
+}
+
 function App() {
   const [adminPassword, setAdminPassword] = useState<string>(() => sessionStorage.getItem('vendor_admin_pwd') || '')
   const [passwordInput, setPasswordInput] = useState('')
@@ -32,6 +79,13 @@ function App() {
   const [notice, setNotice] = useState('')
   const [loading, setLoading] = useState(false)
 
+  // Add client machine whitelist form state
+  const [newMachineId, setNewMachineId] = useState('')
+  const [newCustomerName, setNewCustomerName] = useState('')
+  const [planPreset, setPlanPreset] = useState<PlanPreset>('lifetime')
+  const [customExpiresAt, setCustomExpiresAt] = useState('')
+  const [addingDevice, setAddingDevice] = useState(false)
+
   const apiFetch = async (endpoint: string, options: any = {}, pwdOverride?: string) => {
     const pwd = pwdOverride ?? adminPassword
     const res = await fetch(endpoint, {
@@ -42,7 +96,13 @@ function App() {
         ...(options.headers || {}),
       },
     })
-    const data = await res.json()
+    const text = await res.text()
+    let data: any = {}
+    try {
+      data = text ? JSON.parse(text) : {}
+    } catch {
+      data = { error: text || `خطأ من الخادم (HTTP ${res.status})` }
+    }
     return { ok: res.ok, status: res.status, data }
   }
 
@@ -115,7 +175,7 @@ function App() {
     try {
       const { ok, data } = await apiFetch('/api/vendor/toggle-lock', {
         method: 'POST',
-        body: JSON.stringify({ isLocked: !isLocked })
+        body: JSON.stringify({ isLocked: !isLocked }),
       })
       if (ok && data.success) {
         setIsLocked(data.isLocked)
@@ -151,10 +211,10 @@ function App() {
     try {
       const { ok, data } = await apiFetch('/api/vendor/toggle-device', {
         method: 'POST',
-        body: JSON.stringify({ machineId, isApproved: !currentApproval })
+        body: JSON.stringify({ machineId, isApproved: !currentApproval }),
       })
       if (ok && data.success) {
-        setDevices(prev => prev.map(d => d.id === machineId ? { ...d, isApproved: !currentApproval } : d))
+        setDevices(prev => prev.map(d => d.id === machineId ? { ...d, ...(data.device || {}), isApproved: !currentApproval } : d))
         showNotice(!currentApproval ? 'تم تفعيل وترخيص الجهاز بنجاح' : 'تم قفل الجهاز وإيقافه فوراً')
       } else {
         setError(data.error || 'فشل في تحديث حالة الجهاز')
@@ -164,13 +224,109 @@ function App() {
     }
   }
 
+  const updateDevicePlan = async (machineId: string, licenseType: 'lifetime' | 'timed', durationDays?: number) => {
+    setError('')
+    try {
+      const { ok, data } = await apiFetch('/api/vendor/toggle-device', {
+        method: 'POST',
+        body: JSON.stringify({ machineId, isApproved: true, licenseType, durationDays }),
+      })
+      if (ok && data.success) {
+        setDevices(prev => prev.map(d => d.id === machineId ? { ...d, ...(data.device || {}), isApproved: true } : d))
+        showNotice(
+          licenseType === 'lifetime'
+            ? 'تم تحويل الجهاز إلى تفعيل دائم (مدى الحياة)'
+            : `تم تمديد اشتراك الجهاز بمقدار ${durationDays} يوم بنجاح`
+        )
+      } else {
+        setError(data.error || 'فشل في تحديث الاشتراك')
+      }
+    } catch {
+      setError('تعذر تحديث اشتراك الجهاز')
+    }
+  }
+
+  const addWhitelistedDevice = async (e: FormEvent) => {
+    e.preventDefault()
+    const cleanId = newMachineId.trim().replace(/[\s-]+/g, '').toUpperCase()
+    if (!cleanId || cleanId.length < 8) {
+      setError('يرجى إدخال كود حاسبة العميل بشكل صحيح')
+      return
+    }
+    if (planPreset === 'custom' && !customExpiresAt) {
+      setError('يرجى اختيار تاريخ انتهاء الاشتراك')
+      return
+    }
+    setAddingDevice(true)
+    setError('')
+    try {
+      const body: any = {
+        machineId: cleanId,
+        customerName: newCustomerName.trim() || undefined,
+        licenseType: planPreset === 'lifetime' ? 'lifetime' : 'timed',
+      }
+      if (planPreset === 'custom') {
+        body.expiresAt = customExpiresAt
+      } else if (planPreset !== 'lifetime') {
+        body.durationDays = Number(planPreset)
+      }
+
+      const { ok, data } = await apiFetch('/api/vendor/add-device', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+      if (ok && data.success) {
+        setDevices(prev => {
+          const exists = prev.some(d => d.id === data.device.id)
+          if (exists) return prev.map(d => d.id === data.device.id ? { ...d, ...data.device } : d)
+          return [data.device, ...prev]
+        })
+        setNewMachineId('')
+        setNewCustomerName('')
+        showNotice(`تمت إضافة وتفعيل كود الحاسبة (${cleanId}) بنجاح`)
+      } else {
+        setError(data.error || 'فشل في إضافة كود الحاسبة')
+      }
+    } catch {
+      setError('تعذر الاتصال بالخادم السحابي')
+    } finally {
+      setAddingDevice(false)
+    }
+  }
+
+  const downloadWhitelistFile = async (machineId?: string) => {
+    setError('')
+    try {
+      const { ok, data } = await apiFetch('/api/vendor/export-whitelist', {
+        method: 'POST',
+        body: JSON.stringify(machineId ? { machineId } : {}),
+      })
+      if (ok && data.success) {
+        const blob = new Blob([data.content], { type: 'application/octet-stream' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = data.filename || 'whitelist.dat'
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+        showNotice(`تم تحميل ملف whitelist.dat المشفر (${data.count} جهاز). ضعه بجانب التطبيق للعمل أوفلاين.`)
+      } else {
+        setError(data.error || 'فشل في تصدير ملف القائمة البيضاء')
+      }
+    } catch {
+      setError('تعذر تصدير ملف whitelist.dat')
+    }
+  }
+
   const deleteDevice = async (machineId: string) => {
     if (!confirm('هل أنت متأكد من حذف هذا الجهاز؟ سيتم قفله فوراً إذا كان يعمل.')) return
     setError('')
     try {
       const { ok, data } = await apiFetch('/api/vendor/delete-device', {
         method: 'POST',
-        body: JSON.stringify({ machineId })
+        body: JSON.stringify({ machineId }),
       })
       if (ok && data.success) {
         setDevices(prev => prev.filter(d => d.id !== machineId))
@@ -311,8 +467,8 @@ function App() {
             onClick={toggleLock}
             disabled={loading}
             className={`px-6 py-3 rounded-xl font-bold text-sm text-white shadow-md transition-all shrink-0 flex items-center gap-2 ${
-              isLocked 
-                ? 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-200' 
+              isLocked
+                ? 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-200'
                 : 'bg-red-600 hover:bg-red-700 shadow-red-200'
             }`}
           >
@@ -330,6 +486,96 @@ function App() {
           </button>
         </div>
 
+        {/* Add Client Machine ID (Whitelist) Section */}
+        <form onSubmit={addWhitelistedDevice} className="bg-white rounded-2xl shadow-sm border border-indigo-200 p-6 space-y-4">
+          <div className="flex items-center justify-between flex-wrap gap-3">
+            <div>
+              <h2 className="text-lg font-bold text-gray-900 flex items-center gap-2">
+                <PlusCircle size={20} className="text-indigo-600" />
+                <span>إدخال وتفعيل كود حاسبة عميل (Whitelist)</span>
+              </h2>
+              <p className="text-sm text-gray-500 mt-0.5">
+                أدخل كود حاسبة العميل الذي يظهر له في أول شاشة لتفعيل جهازه (تفعيل دائم أو اشتراك مؤقت)
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => downloadWhitelistFile()}
+              className="px-3.5 py-2 rounded-xl text-xs font-bold bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200 flex items-center gap-1.5 transition-colors"
+            >
+              <Download size={14} />
+              <span>تصدير whitelist.dat لكل المفعلين (أوفلاين)</span>
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div className="md:col-span-2">
+              <label className="block text-xs font-bold text-gray-700 mb-1">كود حاسبة العميل (Machine ID) *</label>
+              <input
+                type="text"
+                value={newMachineId}
+                onChange={(e) => setNewMachineId(e.target.value)}
+                placeholder="مثال: A1B2C3D4E5F6..."
+                dir="ltr"
+                className="w-full px-3.5 py-2.5 rounded-xl border border-gray-300 font-mono text-sm text-left focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-gray-700 mb-1">اسم الصيدلية / العميل (اختياري)</label>
+              <input
+                type="text"
+                value={newCustomerName}
+                onChange={(e) => setNewCustomerName(e.target.value)}
+                placeholder="مثال: صيدلية الشفاء"
+                className="w-full px-3.5 py-2.5 rounded-xl border border-gray-300 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <span className="text-xs font-bold text-gray-700 ml-1">مدة التفعيل:</span>
+            {([
+              ['lifetime', 'دائم (مدى الحياة)'],
+              ['30', 'شهري (30 يوم)'],
+              ['90', '3 أشهر (90 يوم)'],
+              ['180', '6 أشهر (180 يوم)'],
+              ['365', 'سنوي (365 يوم)'],
+              ['custom', 'تاريخ مخصص'],
+            ] as [PlanPreset, string][]).map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setPlanPreset(key)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${
+                  planPreset === key
+                    ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
+                    : 'bg-gray-50 text-gray-700 border-gray-200 hover:bg-gray-100'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+
+            {planPreset === 'custom' && (
+              <input
+                type="date"
+                value={customExpiresAt}
+                onChange={(e) => setCustomExpiresAt(e.target.value)}
+                className="px-3 py-1.5 rounded-lg border border-indigo-300 text-xs font-bold"
+              />
+            )}
+
+            <button
+              type="submit"
+              disabled={addingDevice}
+              className="mr-auto px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-sm flex items-center gap-1.5 transition-colors disabled:opacity-50"
+            >
+              <CheckCircle size={15} />
+              <span>{addingDevice ? 'جاري التفعيل...' : 'إضافة وتفعيل كود الحاسبة'}</span>
+            </button>
+          </div>
+        </form>
+
         {/* Customer Databases Grid */}
         {customers.length > 0 && (
           <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 space-y-4">
@@ -338,7 +584,7 @@ function App() {
               <span>قواعد بيانات العملاء المستقلة ({customers.length})</span>
             </h2>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-              <div 
+              <div
                 onClick={() => setSelectedCustomerId('all')}
                 className={`p-4 rounded-xl border cursor-pointer transition-all ${
                   selectedCustomerId === 'all'
@@ -397,7 +643,7 @@ function App() {
                 <span>قائمة الأجهزة وتراخيصها ({filteredDevices.length})</span>
               </h2>
               <p className="text-sm text-gray-500 mt-0.5">
-                يمكنك قفل أو فتح أي جهاز بصورة فورية بضغطة زر
+                يمكنك قفل أو فتح أو تمديد اشتراك أي جهاز بصورة فورية بضغطة زر
               </p>
             </div>
             <div className="flex items-center gap-2">
@@ -429,72 +675,123 @@ function App() {
             </div>
           ) : (
             <div className="divide-y divide-gray-100">
-              {filteredDevices.map((device) => (
-                <div key={device.id} className="p-6 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 hover:bg-slate-50 transition-colors">
-                  <div className="flex items-start gap-4">
-                    <div className={`w-12 h-12 rounded-xl flex items-center justify-center shrink-0 mt-1 ${
-                      device.isApproved ? 'bg-emerald-50 text-emerald-600 border border-emerald-200' : 'bg-red-50 text-red-600 border border-red-200'
-                    }`}>
-                      <Laptop size={24} />
-                    </div>
-                    <div>
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <h3 className="font-bold text-gray-900 text-base">{device.hostname || 'كمبيوتر صيدلية'}</h3>
-                        
-                        {device.customerId && (
-                          <span className="inline-flex items-center gap-1 bg-indigo-100 text-indigo-800 text-xs font-bold px-2.5 py-0.5 rounded-md">
-                            <Store size={12} />
-                            {device.customerName || device.customerId}
+              {filteredDevices.map((device) => {
+                const exp = getExpiryInfo(device)
+                return (
+                  <div key={device.id} className="p-6 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 hover:bg-slate-50 transition-colors">
+                    <div className="flex items-start gap-4">
+                      <div className={`w-12 h-12 rounded-xl flex items-center justify-center shrink-0 mt-1 ${
+                        device.isApproved && !exp.isExpired ? 'bg-emerald-50 text-emerald-600 border border-emerald-200' : 'bg-red-50 text-red-600 border border-red-200'
+                      }`}>
+                        <Laptop size={24} />
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <h3 className="font-bold text-gray-900 text-base">{device.hostname || 'كمبيوتر صيدلية'}</h3>
+
+                          {device.customerId && (
+                            <span className="inline-flex items-center gap-1 bg-indigo-100 text-indigo-800 text-xs font-bold px-2.5 py-0.5 rounded-md">
+                              <Store size={12} />
+                              {device.customerName || device.customerId}
+                            </span>
+                          )}
+
+                          <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold ${
+                            device.isApproved && !exp.isExpired ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
+                          }`}>
+                            {device.isApproved && !exp.isExpired ? <CheckCircle size={12} /> : <XCircle size={12} />}
+                            {!device.isApproved ? 'مقفل (محظور)' : exp.isExpired ? 'منتهي الاشتراك' : 'مفتوح (مرخص ومفعل)'}
                           </span>
-                        )}
-                        
-                        <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold ${
-                          device.isApproved ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
-                        }`}>
-                          {device.isApproved ? <CheckCircle size={12} /> : <XCircle size={12} />}
-                          {device.isApproved ? 'مفتوح (مرخص ومفعل)' : 'مقفل (محظور)'}
-                        </span>
-                      </div>
-                      <div className="mt-1.5 space-y-0.5 text-xs text-gray-500 font-mono">
-                        <p><span className="font-sans font-semibold text-gray-700">بصمة الجهاز (Machine ID):</span> <code className="bg-gray-100 px-1.5 py-0.5 rounded text-gray-800 font-bold">{device.id}</code></p>
-                        {device.osInfo && <p><span className="font-sans text-gray-500">نظام التشغيل:</span> {device.osInfo}</p>}
-                        {device.lastSeen && <p><span className="font-sans text-gray-500">آخر ظهور:</span> {new Date(device.lastSeen).toLocaleString('ar-EG')}</p>}
+
+                          <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold ${
+                            !exp.isTimed
+                              ? 'bg-blue-100 text-blue-800'
+                              : exp.isExpired
+                              ? 'bg-rose-100 text-rose-800'
+                              : 'bg-amber-100 text-amber-800'
+                          }`}>
+                            {!exp.isTimed ? <InfinityIcon size={12} /> : <Clock size={12} />}
+                            {exp.label}
+                          </span>
+                        </div>
+                        <div className="mt-1.5 space-y-0.5 text-xs text-gray-500 font-mono">
+                          <p><span className="font-sans font-semibold text-gray-700">بصمة الجهاز (Machine ID):</span> <code className="bg-gray-100 px-1.5 py-0.5 rounded text-gray-800 font-bold">{device.id}</code></p>
+                          {device.osInfo && <p><span className="font-sans text-gray-500">نظام التشغيل:</span> {device.osInfo}</p>}
+                          {device.lastSeen && <p><span className="font-sans text-gray-500">آخر ظهور:</span> {new Date(device.lastSeen).toLocaleString('ar-EG')}</p>}
+                        </div>
                       </div>
                     </div>
-                  </div>
 
-                  <div className="flex items-center gap-2 shrink-0 self-end md:self-center">
-                    <button
-                      onClick={() => toggleDevice(device.id, !!device.isApproved)}
-                      className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm ${
-                        device.isApproved
-                          ? 'bg-red-100 text-red-800 hover:bg-red-200'
-                          : 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-emerald-200'
-                      }`}
-                    >
-                      {device.isApproved ? (
-                        <>
-                          <Lock size={14} />
-                          <span>قفل الجهاز</span>
-                        </>
-                      ) : (
-                        <>
-                          <Unlock size={14} />
-                          <span>فتح وترخيص الجهاز</span>
-                        </>
+                    <div className="flex items-center flex-wrap gap-1.5 shrink-0 self-end md:self-center">
+                      <button
+                        onClick={() => updateDevicePlan(device.id, 'timed', 30)}
+                        className="px-2.5 py-1.5 rounded-lg text-xs font-bold bg-amber-50 text-amber-800 hover:bg-amber-100 border border-amber-200 flex items-center gap-1"
+                        title="تمديد 30 يوم"
+                      >
+                        <Calendar size={12} />
+                        <span>+30 يوم</span>
+                      </button>
+
+                      <button
+                        onClick={() => updateDevicePlan(device.id, 'timed', 365)}
+                        className="px-2.5 py-1.5 rounded-lg text-xs font-bold bg-indigo-50 text-indigo-800 hover:bg-indigo-100 border border-indigo-200 flex items-center gap-1"
+                        title="تمديد سنة (365 يوم)"
+                      >
+                        <Calendar size={12} />
+                        <span>+سنة</span>
+                      </button>
+
+                      <button
+                        onClick={() => updateDevicePlan(device.id, 'lifetime')}
+                        className="px-2.5 py-1.5 rounded-lg text-xs font-bold bg-blue-50 text-blue-800 hover:bg-blue-100 border border-blue-200 flex items-center gap-1"
+                        title="تفعيل دائم مدى الحياة"
+                      >
+                        <InfinityIcon size={12} />
+                        <span>دائم</span>
+                      </button>
+
+                      {device.isApproved && (
+                        <button
+                          onClick={() => downloadWhitelistFile(device.id)}
+                          className="p-2 rounded-xl text-indigo-600 hover:bg-indigo-50 border border-transparent hover:border-indigo-200 transition-colors"
+                          title="تحميل ملف whitelist.dat لهذا الجهاز (أوفلاين)"
+                        >
+                          <Download size={15} />
+                        </button>
                       )}
-                    </button>
 
-                    <button
-                      onClick={() => deleteDevice(device.id)}
-                      className="p-2 rounded-xl text-gray-400 hover:text-red-600 hover:bg-red-50 transition-colors"
-                      title="حذف من القائمة"
-                    >
-                      <Trash2 size={16} />
-                    </button>
+                      <button
+                        onClick={() => toggleDevice(device.id, !!device.isApproved)}
+                        className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm ${
+                          device.isApproved
+                            ? 'bg-red-100 text-red-800 hover:bg-red-200'
+                            : 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-emerald-200'
+                        }`}
+                      >
+                        {device.isApproved ? (
+                          <>
+                            <Lock size={14} />
+                            <span>قفل الجهاز</span>
+                          </>
+                        ) : (
+                          <>
+                            <Unlock size={14} />
+                            <span>فتح وترخيص</span>
+                          </>
+                        )}
+                      </button>
+
+                      <button
+                        onClick={() => deleteDevice(device.id)}
+                        className="p-2 rounded-xl text-gray-400 hover:text-red-600 hover:bg-red-50 transition-colors"
+                        title="حذف من القائمة"
+                      >
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
                   </div>
-                </div>
-              ))}
+                )
+              })}
             </div>
           )}
         </div>
